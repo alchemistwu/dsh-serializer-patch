@@ -34,15 +34,17 @@ adapter implementing exactly this logic replays a session bricked by
 GLM-5.3-Flash's malformed web_search arguments cleanly.
 
 ---
- packages/llm/llm-deepseek/src/serialize.ts | 67 ++++++++++++++++++--
+ packages/llm/llm-deepseek/src/serialize.ts | 68 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 2 deletions(-)
 
 diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deepseek/src/serialize.ts
+index 1749991..38a5978 100644
 --- a/packages/llm/llm-deepseek/src/serialize.ts
 +++ b/packages/llm/llm-deepseek/src/serialize.ts
-@@ -195,10 +195,22 @@
+@@ -199,20 +199,41 @@ function userContent(parts: readonly WireUserContentPart[]): string | WireUserCo
    return text.join('')
  }
-
+ 
 +/** Validate one tool-call block's arguments. Returns the block when its
 + * `arguments` parse as JSON; otherwise undefined. */
 +function validToolCall(block: Extract<ContentBlock, { type: 'tool-call' }>): typeof block | undefined {
@@ -62,18 +64,16 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
      .filter(block => block.type === 'reasoning')
      .map(block => block.text)
      .join('')
--  const toolCalls = message.content
--    .filter(block => block.type === 'tool-call')
--    .map(block => ({
 +  const dropped: Extract<ContentBlock, { type: 'tool-call' }>[] = []
-+  const toolCalls = message.content
+   const toolCalls = message.content
+-    .filter(block => block.type === 'tool-call')
 +    .filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
 +    .filter(block => {
 +      const valid = validToolCall(block) !== undefined
 +      if (!valid) dropped.push(block)
 +      return valid
 +    })
-+    .map(block => ({
+     .map(block => ({
        id: block.id,
        type: 'function' as const,
        function: { name: block.name, arguments: block.arguments },
@@ -82,15 +82,10 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
 +    const note = `[A tool call to '${block.name}' was removed from history because its arguments were malformed JSON. Original arguments as emitted: ${block.arguments}]`
 +    text = text.length > 0 ? text + '\n' + note : note
 +  }
-
+ 
    return {
      role: 'assistant',
-@@ -239,11 +257,24 @@
- /**
-  * Serialize the conversation. `tool-result` blocks become standalone
-  * `{role: 'tool'}` messages; the harness puts each tool result in its own
-  * user-role message, so a mixed user message contributes its text first and
-  * its tool results as separate wire messages after.
+@@ -245,6 +266,20 @@ function serializeAssistant(message: Message): WireMessage {
   */
  export function serializeMessages(messages: Message[]): WireMessage[] {
    const wire: WireMessage[] = []
@@ -111,10 +106,7 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
    for (const message of messages) {
      assertTextOnly(message.content)
      if (message.role === 'system') {
-@@ -258,9 +289,19 @@
-     const toolResults = message.content.filter(block => block.type === 'tool-result')
-     const text = flattenText(message.content)
-     if (text.length > 0 || toolResults.length === 0) {
+@@ -263,6 +298,14 @@ export function serializeMessages(messages: Message[]): WireMessage[] {
        wire.push({ role: 'user', content: text })
      }
      for (const result of toolResults) {
@@ -129,11 +121,7 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
        wire.push({
          role: 'tool',
          tool_call_id: result.toolCallId,
-@@ -280,6 +321,7 @@
- export async function serializeMessagesWithImages(
-   messages: readonly Message[],
-   images: ImageSerializationOptions,
- ): Promise<WireMessage[]> {
+@@ -289,6 +332,19 @@ export async function serializeMessagesWithImages(
    assertSupportedImageRoles(messages)
    const wire: WireMessage[] = []
    let pendingToolImages: WireImageContentPart[] = []
@@ -153,8 +141,7 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
    const flushToolImages = (): void => {
      if (pendingToolImages.length === 0) return
      wire.push({
-@@ -322,9 +364,18 @@
-     for (const result of toolResults) {
+@@ -327,6 +383,14 @@ export async function serializeMessagesWithImages(
        const parts = await contentParts(result.content, images, messageIndex + 1, nextImage)
        const imageParts = parts.filter((part): part is WireImageContentPart => part.type !== 'text')
        const text = parts.filter(part => part.type === 'text').map(part => part.text).join('')
@@ -169,7 +156,3 @@ diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deeps
        wire.push({
          role: 'tool',
          tool_call_id: result.toolCallId,
-         content: text || '(no output)',
-       })
-       pendingToolImages.push(...imageParts)
-     }
