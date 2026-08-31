@@ -1,0 +1,175 @@
+Subject: [PATCH] llm-deepseek: neutralize tool calls with invalid JSON arguments on the wire
+
+A model can emit a tool call whose `arguments` string is not valid JSON
+(unescaped inner quotes, truncated JSON). OpenAI-compatible servers accept it
+on the streaming generation path but validate strictly on the history-replay
+path, so the poisoned entry persists in the session log and every later
+request in that session fails:
+
+  400 {"message": "Assistant tool call function.arguments must be valid JSON."}
+
+The session is bricked until its log is hand-repaired. Observed in production
+with GLM-5.3-Flash on vLLM 0.27 (unescaped inner quotes in a web_search call).
+
+Fix (wire-level, append-only log untouched):
+
+1. serializeAssistant: validate `arguments` with JSON.parse before emitting.
+   Invalid calls are dropped from `tool_calls`; their omission is recorded in
+   the assistant text as an honest record so the model sees its own mistake
+   and can re-issue a corrected call.
+
+2. serializeMessages / serializeMessagesWithImages: the matching role:"tool"
+   reply for a dropped call is re-expressed as a plain user message
+   ("[Tool Result: <tool>] ...") instead of an orphan role:"tool" entry (an
+   orphan is itself rejected by strict servers). Pattern precedent for
+   re-expressing unmatched tool results as user messages: discussion #4668.
+
+Valid calls pay exactly one JSON.parse. The durable append-only session log
+is never rewritten; dsh-session-repair remains the load-path recovery
+complement.
+
+Diff against packages/llm/llm-deepseek/src/serialize.ts at dsh-v0.1.2-alpha.2
+(commit 0a53fb55). Verified end-to-end in production: an OpenAI-compatible
+adapter implementing exactly this logic replays a session bricked by
+GLM-5.3-Flash's malformed web_search arguments cleanly.
+
+---
+ packages/llm/llm-deepseek/src/serialize.ts | 67 ++++++++++++++++++--
+
+diff --git a/packages/llm/llm-deepseek/src/serialize.ts b/packages/llm/llm-deepseek/src/serialize.ts
+--- a/packages/llm/llm-deepseek/src/serialize.ts
++++ b/packages/llm/llm-deepseek/src/serialize.ts
+@@ -195,10 +195,22 @@
+   return text.join('')
+ }
+
++/** Validate one tool-call block's arguments. Returns the block when its
++ * `arguments` parse as JSON; otherwise undefined. */
++function validToolCall(block: Extract<ContentBlock, { type: 'tool-call' }>): typeof block | undefined {
++  try {
++    JSON.parse(block.arguments)
++    return block
++  } catch {
++    return undefined
++  }
++}
++
+ /** Serialize one assistant message (text + reasoning + tool calls). */
+ function serializeAssistant(message: Message): WireMessage {
+-  const text = flattenText(message.content)
++  let text = flattenText(message.content)
+   const reasoning = message.content
+     .filter(block => block.type === 'reasoning')
+     .map(block => block.text)
+     .join('')
+-  const toolCalls = message.content
+-    .filter(block => block.type === 'tool-call')
+-    .map(block => ({
++  const dropped: Extract<ContentBlock, { type: 'tool-call' }>[] = []
++  const toolCalls = message.content
++    .filter((block): block is Extract<ContentBlock, { type: 'tool-call' }> => block.type === 'tool-call')
++    .filter(block => {
++      const valid = validToolCall(block) !== undefined
++      if (!valid) dropped.push(block)
++      return valid
++    })
++    .map(block => ({
+       id: block.id,
+       type: 'function' as const,
+       function: { name: block.name, arguments: block.arguments },
+     }))
++  for (const block of dropped) {
++    const note = `[A tool call to '${block.name}' was removed from history because its arguments were malformed JSON. Original arguments as emitted: ${block.arguments}]`
++    text = text.length > 0 ? text + '\n' + note : note
++  }
+
+   return {
+     role: 'assistant',
+@@ -239,11 +257,24 @@
+ /**
+  * Serialize the conversation. `tool-result` blocks become standalone
+  * `{role: 'tool'}` messages; the harness puts each tool result in its own
+  * user-role message, so a mixed user message contributes its text first and
+  * its tool results as separate wire messages after.
+  */
+ export function serializeMessages(messages: Message[]): WireMessage[] {
+   const wire: WireMessage[] = []
++  // Pre-pass: collect the ids of tool calls whose arguments are invalid
++  // JSON, so their results can be re-expressed instead of orphaning.
++  const droppedCallIds = new Set<string>()
++  for (const message of messages) {
++    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
++    for (const block of message.content) {
++      if (block.type !== 'tool-call') continue
++      try {
++        JSON.parse(block.arguments)
++      } catch {
++        droppedCallIds.add(block.id)
++      }
++    }
++  }
+   for (const message of messages) {
+     assertTextOnly(message.content)
+     if (message.role === 'system') {
+@@ -258,9 +289,19 @@
+     const toolResults = message.content.filter(block => block.type === 'tool-result')
+     const text = flattenText(message.content)
+     if (text.length > 0 || toolResults.length === 0) {
+       wire.push({ role: 'user', content: text })
+     }
+     for (const result of toolResults) {
++      // A dropped call's result is re-expressed as a user message (an
++      // orphan role:"tool" reply is itself rejected by strict servers).
++      if (droppedCallIds.has(result.toolCallId)) {
++        const resultText = flattenText(result.content) || '(no output)'
++        const note = resultText.length > 0 ? `[Tool Result: ${result.toolCallId}] ${resultText}` : `[Tool Result: ${result.toolCallId}]`
++        wire.push({ role: 'user', content: note })
++        continue
++      }
+       wire.push({
+         role: 'tool',
+         tool_call_id: result.toolCallId,
+@@ -280,6 +321,7 @@
+ export async function serializeMessagesWithImages(
+   messages: readonly Message[],
+   images: ImageSerializationOptions,
+ ): Promise<WireMessage[]> {
+   assertSupportedImageRoles(messages)
+   const wire: WireMessage[] = []
+   let pendingToolImages: WireImageContentPart[] = []
++  // Same dropped-id pre-pass as serializeMessages (invalid JSON arguments).
++  const droppedCallIds = new Set<string>()
++  for (const message of messages) {
++    if (message.role !== 'assistant' || !Array.isArray(message.content)) continue
++    for (const block of message.content) {
++      if (block.type !== 'tool-call') continue
++      try {
++        JSON.parse(block.arguments)
++      } catch {
++        droppedCallIds.add(block.id)
++      }
++    }
++  }
+   const flushToolImages = (): void => {
+     if (pendingToolImages.length === 0) return
+     wire.push({
+@@ -322,9 +364,18 @@
+     for (const result of toolResults) {
+       const parts = await contentParts(result.content, images, messageIndex + 1, nextImage)
+       const imageParts = parts.filter((part): part is WireImageContentPart => part.type !== 'text')
+       const text = parts.filter(part => part.type === 'text').map(part => part.text).join('')
++      // Dropped call's result: re-express as a user message carrying the
++      // result text plus any images (never an orphan role:"tool").
++      if (droppedCallIds.has(result.toolCallId)) {
++        const resultText = text || '(no output)'
++        const note = resultText.length > 0 ? `[Tool Result: ${result.toolCallId}] ${resultText}` : `[Tool Result: ${result.toolCallId}]`
++        wire.push({ role: 'user', content: [{ type: 'text', text: note }, ...imageParts] })
++        continue
++      }
+       wire.push({
+         role: 'tool',
+         tool_call_id: result.toolCallId,
+         content: text || '(no output)',
+       })
+       pendingToolImages.push(...imageParts)
+     }
